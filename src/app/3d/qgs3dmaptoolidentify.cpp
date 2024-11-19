@@ -18,16 +18,20 @@
 
 #include <QScreen>
 
+#include "qgis.h"
 #include "qgsapplication.h"
 #include "qgs3dmapcanvas.h"
 #include "qgs3dmapscene.h"
 #include "qgs3dutils.h"
 #include "qgsvector3d.h"
+#include "qgsgeometry.h"
+#include "qgswkbtypes.h"
 
 #include "qgisapp.h"
 #include "qgsmapcanvas.h"
 #include "qgscoordinateutils.h"
 #include "qgsmaptoolidentifyaction.h"
+#include "qgsmessagelog.h"
 
 #include "qgspointcloudlayer.h"
 #include "qgstiledscenelayer.h"
@@ -112,6 +116,7 @@ void Qgs3DMapToolIdentify::mouseReleaseEvent( QMouseEvent *event )
       Q_UNUSED( tslayer )
       // We are only handling a single hit for each layer
       const QgsRayCastingUtils::RayHit hit = it->second.first();
+      QgsMessageLog::logMessage( QObject::tr( "hit X: %1 Y: %2 Z: %3" ).arg( hit.pos.x() ).arg( hit.pos.y() ).arg( hit.pos.z() ), QString(), Qgis::MessageLevel::Info );
       const QgsVector3D mapCoords = Qgs3DUtils::worldToMapCoordinates( hit.pos, mCanvas->mapSettings()->origin() );
 
       QMap< QString, QString > derivedAttributes;
@@ -137,6 +142,76 @@ void Qgs3DMapToolIdentify::mouseReleaseEvent( QMouseEvent *event )
       // only derived attributes are supported for now, so attributes is empty
       QgsMapToolIdentify::IdentifyResult res( it->first, nodeId, {}, derivedAttributes );
       tiledSceneIdentifyResults.append( res );
+
+      // Attempt to find an existing scratch layer named "scratch_layer"
+      QgsVectorLayer* scratchLayer = nullptr;
+      QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( "scratch_layer" );
+      if ( !layers.isEmpty() )
+      {
+          // Cast the first matching layer to QgsVectorLayer
+          scratchLayer = qobject_cast<QgsVectorLayer *>( layers.at(0) );
+          QgsMessageLog::logMessage( QObject::tr( "Found requested scratch layer." ), QString(), Qgis::MessageLevel::Info );
+      }
+
+      if ( !scratchLayer )
+      {
+          QgsMessageLog::logMessage( QObject::tr( "Scratch layer not found, attempt to create one." ), QString(), Qgis::MessageLevel::Warning );
+          
+          // Define a new temporary scratch layer with a Point geometry and specified CRS
+          QString layerDefinition = "Point?crs=EPSG:32616"; // Adjust CRS if needed
+          scratchLayer = new QgsVectorLayer( layerDefinition, "scratch_layer", "memory" );
+
+          // Check if the layer was successfully created
+          if ( !scratchLayer->isValid() )
+          {
+              QgsMessageLog::logMessage( QObject::tr( "Failed to create scratch layer." ), QString(), Qgis::MessageLevel::Critical );
+              return;
+          }
+
+          // Define and add fields to the new layer
+          QList<QgsField> fields;
+          fields.append( QgsField( "node_content", QVariant::String ) );
+          fields.append( QgsField( "triangle_index", QVariant::Int ) );
+          fields.append( QgsField( "event_pos", QVariant::String ) );
+          fields.append( QgsField( "ray_origin", QVariant::String ) );
+          fields.append( QgsField( "ray_direction", QVariant::String ) );
+          fields.append( QgsField( "derived_point", QVariant::String ) );
+          scratchLayer->dataProvider()->addAttributes( fields );
+          scratchLayer->updateFields();
+
+          // Add the new scratch layer to the current project
+          QgsProject::instance()->addMapLayer( scratchLayer );
+          QgsMessageLog::logMessage( QObject::tr( "Scratch layer successfully created." ), QString(), Qgis::MessageLevel::Info );
+      }
+
+      // Convert a QgsVector3D object to a QgsPoint geometry
+      QgsPoint derivedPoint = QgsPoint( Qgis::WkbType::PointZ, mapCoords.x(), mapCoords.y(), mapCoords.z() );
+      // QgsMessageLog::logMessage( QObject::tr( "event X: %1 Y: %2" ).arg( event->pos().x() ).arg( event->pos().y() ), QString(), Qgis::MessageLevel::Info );
+      // QgsMessageLog::logMessage( QObject::tr( "rayOrigin X: %1 Y: %2 Z: %3" ).arg( ray.origin().x() ).arg( ray.origin().y() ).arg( ray.origin().z() ), QString(), Qgis::MessageLevel::Info );
+      // QgsMessageLog::logMessage( QObject::tr( "rayDirection X: %1 Y: %2 Z: %3" ).arg( ray.direction().x() ).arg( ray.direction().y() ).arg( ray.direction().z() ), QString(), Qgis::MessageLevel::Info );
+      // QgsMessageLog::logMessage( QObject::tr( "mapCoords X: %1 Y: %2 Z: %3" ).arg( mapCoords.x() ).arg( mapCoords.y() ).arg( mapCoords.z() ), QString(), Qgis::MessageLevel::Info );
+      // QgsMessageLog::logMessage( QObject::tr( "derivedPoint X: %1 Y: %2 Z: %3" ).arg( derivedPoint.x() ).arg( derivedPoint.y() ).arg( derivedPoint.z() ), QString(), Qgis::MessageLevel::Info );
+
+      // Create a new feature using the derived point
+      QgsFeature feature( scratchLayer->fields() );
+      QgsGeometry geometry = QgsGeometry::fromPoint( derivedPoint );
+      feature.setAttribute( "node_content", derivedAttributes[ QStringLiteral( "node_content" ) ] );
+      feature.setAttribute( "triangle_index", derivedAttributes[ QStringLiteral( "triangle_index" ) ].toInt() );
+      feature.setAttribute( "event_pos", QObject::tr( "POINT(%1 %2)" ).arg( event->pos().x() ).arg( event->pos().y() ));
+      feature.setAttribute( "ray_origin", QObject::tr( "POINT(%1 %2 %3)" ).arg( QLocale().toString( ray.origin().x(), 'f' ) ).arg( QLocale().toString( ray.origin().y(), 'f' ) ).arg( QLocale().toString( ray.origin().z(), 'f' ) ) );
+      feature.setAttribute( "ray_direction", QObject::tr( "POINT(%1 %2 %3)" ).arg( QLocale().toString( ray.direction().x(), 'f' ) ).arg( QLocale().toString( ray.direction().y(), 'f' ) ).arg( QLocale().toString( ray.direction().z(), 'f' ) ) );
+      feature.setAttribute( "derived_point", QObject::tr( "POINT(%1 %2 %3)" ).arg( QLocale().toString( derivedPoint.x(), 'f' ) ).arg( QLocale().toString( derivedPoint.y(), 'f' ) ).arg( QLocale().toString( derivedPoint.z(), 'f' ) ) );
+      feature.setGeometry( geometry );
+
+      // Add the feature to the scratch layer
+      QgsVectorDataProvider* provider = scratchLayer->dataProvider();
+      if ( !provider->addFeature( feature ) )
+      {
+          QgsMessageLog::logMessage( QObject::tr( "Failed to add feature to scratch layer." ), QString(), Qgis::MessageLevel::Warning );
+      }
+
+      // Update the layer's extents to reflect the new feature
+      scratchLayer->updateExtents();
     }
   }
 
